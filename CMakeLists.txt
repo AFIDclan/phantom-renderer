@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(vulcan-headless LANGUAGES CXX)
+project(phantom-renderer LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -173,21 +173,21 @@ target_compile_options(vh PRIVATE
 # Executable
 # ---------------------------------------------------------------------------
 
-add_executable(vulcan-headless
+add_executable(phantom-renderer
     src/main.cpp
 )
 
-add_dependencies(vulcan-headless shaders)
+add_dependencies(phantom-renderer shaders)
 
-target_link_libraries(vulcan-headless PRIVATE
+target_link_libraries(phantom-renderer PRIVATE
     vh
 )
 
-target_compile_options(vulcan-headless PRIVATE
+target_compile_options(phantom-renderer PRIVATE
     -Wall -Wextra -O2
 )
 
-target_compile_options(vulcan-headless PRIVATE
+target_compile_options(phantom-renderer PRIVATE
     -Wall -Wextra -O2
 )
 
@@ -205,13 +205,13 @@ else()
 endif()
 
 add_custom_target(run
-    COMMAND vulcan-headless
+    COMMAND phantom-renderer
         --spirv-dir ${SPIRV_OUTPUT_DIR}
         --output ${CMAKE_BINARY_DIR}/render_output.png
         --width 1280
         --height 720
         ${SCENE_ARGS}
-    DEPENDS vulcan-headless shaders
+    DEPENDS phantom-renderer shaders
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-    COMMENT "Running vulcan-headless renderer"
+    COMMENT "Running phantom-renderer renderer"
 )

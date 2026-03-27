@@ -242,7 +242,7 @@ int HeadlessRenderer::exportReadbackMemFd() const {
 void HeadlessRenderer::createInstance() {
     VkApplicationInfo ai{};
     ai.sType            = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    ai.pApplicationName = "vulcan-headless";
+    ai.pApplicationName = "phantom-renderer";
     ai.apiVersion       = VK_API_VERSION_1_1;
 
     VkInstanceCreateInfo ci{};

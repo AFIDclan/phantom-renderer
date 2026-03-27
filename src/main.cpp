@@ -1,12 +1,12 @@
 /**
- * vulcan-headless: entry point
+ * phantom-renderer: entry point
  *
  * Parses CLI arguments, loads a scene (glTF or built-in demo),
  * renders one frame with the headless Vulkan renderer, and writes
  * the result through the configured IFrameOutput.
  *
  * Usage:
- *   vulcan-headless [--scene <path.gltf>] [--output <out.png>]
+ *   phantom-renderer [--scene <path.gltf>] [--output <out.png>]
  *                  [--width <px>] [--height <px>] [--spirv-dir <dir>]
  *                  [--render-mode unlit|lambert|pbr]
  *

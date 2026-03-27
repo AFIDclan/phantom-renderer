@@ -1,4 +1,4 @@
-# vulcan-headless
+# phantom-renderer
 
 Headless Vulkan renderer for the Daxos vision pipeline. Renders glTF 2.0 scenes offscreen to RGBA frames — no display or swapchain required.
 
@@ -28,7 +28,7 @@ cmake --build build/
 cmake --build build/ --target run
 
 # Run manually with explicit arguments
-./build/vulcan-headless \
+./build/phantom-renderer \
   --scene Scene.gltf \
   --output out.png \
   --spirv-dir build/shaders \

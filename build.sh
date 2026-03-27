@@ -1,11 +1,11 @@
 #!/bin/bash
-# build.sh — Install dependencies and build vulcan-headless
+# build.sh — Install dependencies and build phantom-renderer
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build"
 
-echo "=== vulcan-headless build script ==="
+echo "=== phantom-renderer build script ==="
 
 # ---------------------------------------------------------------------------
 # Install dependencies if not already present
@@ -44,7 +44,7 @@ echo ""
 echo "=== Build complete ==="
 echo ""
 echo "To run:"
-echo "  $BUILD_DIR/vulcan-headless --spirv-dir $BUILD_DIR/shaders --output render_output.png"
+echo "  $BUILD_DIR/phantom-renderer --spirv-dir $BUILD_DIR/shaders --output render_output.png"
 echo ""
 echo "Or use the cmake 'run' target:"
 echo "  cmake --build $BUILD_DIR --target run"
