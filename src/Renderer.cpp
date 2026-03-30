@@ -1,11 +1,16 @@
 #include "vh/Renderer.h"
 #include "vh/SpirvBlobs.h"
 
+#include "stb_image.h"
+
 #include <array>
 #include <cassert>
+#include <cstdlib>
+#include <filesystem>
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -58,6 +63,181 @@ static VkSampleCountFlagBits getMaxUsableSampleCount(VkPhysicalDevice pd) {
     return VK_SAMPLE_COUNT_1_BIT;
 }
 
+static void expandBounds(Vec3& minP, Vec3& maxP, Vec3 p) {
+    minP.x = std::min(minP.x, p.x);
+    minP.y = std::min(minP.y, p.y);
+    minP.z = std::min(minP.z, p.z);
+    maxP.x = std::max(maxP.x, p.x);
+    maxP.y = std::max(maxP.y, p.y);
+    maxP.z = std::max(maxP.z, p.z);
+}
+
+static Mat4 computeDirectionalLightMatrix(const RenderScene& scene, Vec3 lightDir) {
+    if (scene.draws.empty() || scene.indices.empty() || scene.vertices.empty())
+        return Mat4::identity();
+
+    const float inf = std::numeric_limits<float>::infinity();
+    Vec3 worldMin{ inf,  inf,  inf};
+    Vec3 worldMax{-inf, -inf, -inf};
+
+    for (const DrawCall& dc : scene.draws) {
+        for (uint32_t i = 0; i < dc.indexCount; ++i) {
+            uint32_t idx = scene.indices[dc.firstIndex + i] + static_cast<uint32_t>(dc.vertexOffset);
+            const Vertex& v = scene.vertices[idx];
+            Vec3 local = {v.pos[0], v.pos[1], v.pos[2]};
+            expandBounds(worldMin, worldMax, transformPoint(dc.transform, local));
+        }
+    }
+
+    if (length(lightDir) < 0.0001f)
+        lightDir = {0.f, -1.f, 0.f};
+
+    Vec3 sceneCenter = mul(add(worldMin, worldMax), 0.5f);
+    float sceneRadius = std::max(length(sub(worldMax, worldMin)) * 0.5f, 1.0f);
+    Vec3 forward      = normalize(lightDir);
+    Vec3 up           = std::abs(dot(forward, Vec3{0.f, 1.f, 0.f})) > 0.99f
+                      ? Vec3{1.f, 0.f, 0.f}
+                      : Vec3{0.f, 1.f, 0.f};
+    Vec3 lightPos     = sub(sceneCenter, mul(forward, sceneRadius + 1.0f));
+    Mat4 lightView    = Mat4::lookAt(lightPos, sceneCenter, up);
+
+    Vec3 lightMin{ inf,  inf,  inf};
+    Vec3 lightMax{-inf, -inf, -inf};
+    for (const DrawCall& dc : scene.draws) {
+        for (uint32_t i = 0; i < dc.indexCount; ++i) {
+            uint32_t idx = scene.indices[dc.firstIndex + i] + static_cast<uint32_t>(dc.vertexOffset);
+            const Vertex& v = scene.vertices[idx];
+            Vec3 local = {v.pos[0], v.pos[1], v.pos[2]};
+            Vec3 world = transformPoint(dc.transform, local);
+            expandBounds(lightMin, lightMax, transformPoint(lightView, world));
+        }
+    }
+
+    constexpr float kPadXY = 0.5f;
+    constexpr float kPadZ  = 1.0f;
+    float nearPlane = std::max(0.01f, -lightMax.z - kPadZ);
+    float farPlane  = std::max(nearPlane + 0.1f, -lightMin.z + kPadZ);
+    Mat4 lightProj  = Mat4::ortho(lightMin.x - kPadXY, lightMax.x + kPadXY,
+                                  lightMin.y - kPadXY, lightMax.y + kPadXY,
+                                  nearPlane, farPlane);
+    return lightProj * lightView;
+}
+
+struct SkyboxPixels {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<uint8_t> rgba;
+};
+
+static float clamp01(float v) {
+    return std::max(0.f, std::min(1.f, v));
+}
+
+static uint8_t linearToSrgb8(float v) {
+    v = std::max(v, 0.f);
+    v = v / (1.f + v);
+    v = std::pow(v, 1.f / 2.2f);
+    return static_cast<uint8_t>(clamp01(v) * 255.f + 0.5f);
+}
+
+static SkyboxPixels makeFallbackSkybox() {
+    SkyboxPixels sky;
+    sky.width = 1024;
+    sky.height = 512;
+    sky.rgba.resize(static_cast<size_t>(sky.width) * sky.height * 4);
+
+    for (uint32_t y = 0; y < sky.height; ++y) {
+        float t = static_cast<float>(y) / static_cast<float>(sky.height - 1);
+        float horizon = clamp01(std::abs(t - 0.5f) * 2.f);
+        float r = (1.f - horizon) * 0.92f + horizon * 0.18f;
+        float g = (1.f - horizon) * 0.84f + horizon * 0.30f;
+        float b = (1.f - horizon) * 0.70f + horizon * 0.58f;
+        if (t > 0.55f) {
+            float ground = (t - 0.55f) / 0.45f;
+            r = r * (1.f - ground) + 0.52f * ground;
+            g = g * (1.f - ground) + 0.46f * ground;
+            b = b * (1.f - ground) + 0.38f * ground;
+        }
+        for (uint32_t x = 0; x < sky.width; ++x) {
+            size_t idx = (static_cast<size_t>(y) * sky.width + x) * 4;
+            sky.rgba[idx + 0] = static_cast<uint8_t>(r * 255.f + 0.5f);
+            sky.rgba[idx + 1] = static_cast<uint8_t>(g * 255.f + 0.5f);
+            sky.rgba[idx + 2] = static_cast<uint8_t>(b * 255.f + 0.5f);
+            sky.rgba[idx + 3] = 255;
+        }
+    }
+    return sky;
+}
+
+static std::string resolveDefaultSkyboxPath(const std::string& overridePath) {
+    namespace fs = std::filesystem;
+
+    if (!overridePath.empty())
+        return overridePath;
+
+    std::vector<fs::path> candidates;
+    if (const char* envDir = std::getenv("PHANTOM_RENDERER_RESOURCES_DIR"))
+        candidates.emplace_back(fs::path(envDir) / "skybox-1.hdr");
+    candidates.emplace_back(fs::path("resources") / "skybox-1.hdr");
+#ifdef VH_BUILD_RESOURCE_DIR
+    candidates.emplace_back(fs::path(VH_BUILD_RESOURCE_DIR) / "skybox-1.hdr");
+#endif
+#ifdef VH_SOURCE_RESOURCE_DIR
+    candidates.emplace_back(fs::path(VH_SOURCE_RESOURCE_DIR) / "skybox-1.hdr");
+#endif
+#ifdef VH_INSTALL_RESOURCE_DIR
+    candidates.emplace_back(fs::path(VH_INSTALL_RESOURCE_DIR) / "skybox-1.hdr");
+#endif
+
+    for (const fs::path& candidate : candidates) {
+        if (!candidate.empty() && fs::exists(candidate))
+            return candidate.string();
+    }
+    return {};
+}
+
+static SkyboxPixels loadSkyboxPixels(const std::string& path) {
+    if (path.empty())
+        return makeFallbackSkybox();
+
+    int width = 0, height = 0, channels = 0;
+    if (stbi_is_hdr(path.c_str())) {
+        float* pixels = stbi_loadf(path.c_str(), &width, &height, &channels, 4);
+        if (!pixels) {
+            fprintf(stderr, "Warning: failed to load skybox '%s' (%s); using fallback sky.\n",
+                    path.c_str(), stbi_failure_reason());
+            return makeFallbackSkybox();
+        }
+
+        SkyboxPixels sky;
+        sky.width = static_cast<uint32_t>(width);
+        sky.height = static_cast<uint32_t>(height);
+        sky.rgba.resize(static_cast<size_t>(width) * height * 4);
+        for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i) {
+            sky.rgba[i * 4 + 0] = linearToSrgb8(pixels[i * 4 + 0]);
+            sky.rgba[i * 4 + 1] = linearToSrgb8(pixels[i * 4 + 1]);
+            sky.rgba[i * 4 + 2] = linearToSrgb8(pixels[i * 4 + 2]);
+            sky.rgba[i * 4 + 3] = 255;
+        }
+        stbi_image_free(pixels);
+        return sky;
+    }
+
+    stbi_uc* pixels = stbi_load(path.c_str(), &width, &height, &channels, 4);
+    if (!pixels) {
+        fprintf(stderr, "Warning: failed to load skybox '%s' (%s); using fallback sky.\n",
+                path.c_str(), stbi_failure_reason());
+        return makeFallbackSkybox();
+    }
+
+    SkyboxPixels sky;
+    sky.width = static_cast<uint32_t>(width);
+    sky.height = static_cast<uint32_t>(height);
+    sky.rgba.assign(pixels, pixels + static_cast<size_t>(width) * height * 4);
+    stbi_image_free(pixels);
+    return sky;
+}
+
 // ----------------------------------------------------------------------------
 // Constructor / destructor
 // ----------------------------------------------------------------------------
@@ -90,9 +270,11 @@ void HeadlessRenderer::init() {
     createSceneUBO();
     createWhiteTexture();
     createDefaultMetalRoughTexture();
+    createSkyboxTexture();
     allocateGlobalDescriptorSet();
     createShadowFacesDescriptors();
     createShadowPipeline();
+    createSkyboxPipeline();
     createGraphicsPipeline();
     createReadbackBuffer();
     allocateCommandBuffer();
@@ -185,20 +367,32 @@ void HeadlessRenderer::uploadScene(const RenderScene& scene) {
     }
 
     // ---- UBO (light data) ---------------------------------------------------
-    memset(&uboData_, 0, sizeof(uboData_));
-    uboData_.shadowNear = SHADOW_NEAR;
-    uboData_.shadowFar  = SHADOW_FAR;
+    uboData_ = {};
+    uboData_.lightVP     = Mat4::identity();
+    uboData_.skyboxParams[2] = skyboxIntensity_;
+    uboData_.skyboxParams[3] = skyboxView_ ? 1.f : 0.f;
+    uboData_.skyboxUp[0] = skyboxUp_.x;
+    uboData_.skyboxUp[1] = skyboxUp_.y;
+    uboData_.skyboxUp[2] = skyboxUp_.z;
+    uboData_.shadowNear      = SHADOW_NEAR;
+    uboData_.shadowFar       = SHADOW_FAR;
     if (!scene.lights.empty()) {
         const Light& l = scene.lights[0];
         uboData_.lightPos[0]   = l.position.x;
         uboData_.lightPos[1]   = l.position.y;
         uboData_.lightPos[2]   = l.position.z;
         uboData_.lightPos[3]   = 0.f;
+        uboData_.lightDir[0]   = l.direction.x;
+        uboData_.lightDir[1]   = l.direction.y;
+        uboData_.lightDir[2]   = l.direction.z;
+        uboData_.lightDir[3]   = 0.f;
         uboData_.lightColor[0] = l.color.x;
         uboData_.lightColor[1] = l.color.y;
         uboData_.lightColor[2] = l.color.z;
         uboData_.lightColor[3] = l.intensity;
         uboData_.lightType     = static_cast<uint32_t>(l.type);
+        if (l.type == LightType::Directional)
+            uboData_.lightVP = computeDirectionalLightMatrix(scene, l.direction);
     }
     {
         void* mapped;
@@ -223,6 +417,23 @@ void HeadlessRenderer::renderNoReadback(const Mat4& view, const Mat4& proj) {
     recordCommandBuffer(view, proj);
     submitAndWait();
     readTimestamps();
+}
+
+void HeadlessRenderer::setSkyboxPath(const std::string& path) {
+    skyboxPath_ = path;
+    if (!device_)
+        return;
+
+    vkDeviceWaitIdle(device_);
+    createSkyboxTexture();
+}
+
+void HeadlessRenderer::setSkyboxUp(Vec3 up) {
+    if (length(up) < 0.0001f) {
+        skyboxUp_ = {0.f, 1.f, 0.f};
+        return;
+    }
+    skyboxUp_ = normalize(up);
 }
 
 int HeadlessRenderer::exportReadbackMemFd() const {
@@ -373,6 +584,13 @@ void HeadlessRenderer::createShadowAttachments() {
     lci.subresourceRange.layerCount     = 6;
     VK_CHECK(vkCreateImageView(device_, &lci, nullptr, &shadowLayeredView_));
 
+    createImage(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, VK_FORMAT_D32_SFLOAT,
+                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                shadowDirImage_, shadowDirImageMem_);
+    shadowDirView_ = createImageView(shadowDirImage_, VK_FORMAT_D32_SFLOAT,
+                                     VK_IMAGE_ASPECT_DEPTH_BIT);
+
     // Sampler with depth comparison (cube maps use CLAMP_TO_EDGE, no border needed).
     VkSamplerCreateInfo sci{};
     sci.sType         = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -435,6 +653,11 @@ void HeadlessRenderer::createShadowFramebuffers() {
     ci.height          = SHADOW_MAP_SIZE;
     ci.layers          = 6;
     VK_CHECK(vkCreateFramebuffer(device_, &ci, nullptr, &shadowLayeredFB_));
+
+    VkImageView dirAttachment = shadowDirView_;
+    ci.pAttachments = &dirAttachment;
+    ci.layers       = 1;
+    VK_CHECK(vkCreateFramebuffer(device_, &ci, nullptr, &shadowDirFB_));
 }
 
 // ---- Main render pass (MSAA) -----------------------------------------------
@@ -584,7 +807,7 @@ void HeadlessRenderer::createFramebuffer() {
 // ---- Descriptors -----------------------------------------------------------
 
 void HeadlessRenderer::createDescriptorSetLayouts() {
-    // Set 0: UBO (vert+frag) + shadow sampler (frag)
+    // Set 0: UBO (vert+frag) + shadow samplers + skybox sampler (frag)
     {
         VkDescriptorSetLayoutBinding b0{};
         b0.binding        = 0;
@@ -598,7 +821,19 @@ void HeadlessRenderer::createDescriptorSetLayouts() {
         b1.descriptorCount= 1;
         b1.stageFlags     = VK_SHADER_STAGE_FRAGMENT_BIT;
 
-        std::array<VkDescriptorSetLayoutBinding, 2> bindings = {b0, b1};
+        VkDescriptorSetLayoutBinding b2{};
+        b2.binding        = 2;
+        b2.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b2.descriptorCount= 1;
+        b2.stageFlags     = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorSetLayoutBinding b3{};
+        b3.binding        = 3;
+        b3.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b3.descriptorCount= 1;
+        b3.stageFlags     = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        std::array<VkDescriptorSetLayoutBinding, 4> bindings = {b0, b1, b2, b3};
         VkDescriptorSetLayoutCreateInfo ci{};
         ci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         ci.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -628,13 +863,13 @@ void HeadlessRenderer::createDescriptorSetLayouts() {
 
 void HeadlessRenderer::createDescriptorPool() {
     // Fixed-set pool for exactly 3 sets that live for the renderer's lifetime:
-    //   set 0 (global):      1 UBO + 1 shadow sampler (combined-image-sampler)
+    //   set 0 (global):      1 UBO + 3 samplers (cube + directional + skybox)
     //   set 0 (shadowFaces): 1 UBO
     //   set 1 (white):       2 combined-image-samplers (baseColor + metalRough fallback)
     // Per-draw/per-scene sets are managed in sceneDescPool_, rebuilt on uploadScene().
     std::array<VkDescriptorPoolSize, 2> sizes{};
     sizes[0] = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         2 };  // sceneUBO + shadowFacesUBO
-    sizes[1] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 };  // 1 shadow + 2 white-fallback
+    sizes[1] = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 };  // 3 global + 2 white-fallback
 
     VkDescriptorPoolCreateInfo ci{};
     ci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -709,12 +944,22 @@ void HeadlessRenderer::allocateGlobalDescriptorSet() {
     bufInfo.offset = 0;
     bufInfo.range  = sizeof(SceneUBOData);
 
-    VkDescriptorImageInfo shadowInfo{};
-    shadowInfo.sampler     = shadowSampler_;
-    shadowInfo.imageView   = shadowCubeView_;
-    shadowInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    VkDescriptorImageInfo shadowCubeInfo{};
+    shadowCubeInfo.sampler     = shadowSampler_;
+    shadowCubeInfo.imageView   = shadowCubeView_;
+    shadowCubeInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
-    std::array<VkWriteDescriptorSet, 2> writes{};
+    VkDescriptorImageInfo shadowDirInfo{};
+    shadowDirInfo.sampler     = shadowSampler_;
+    shadowDirInfo.imageView   = shadowDirView_;
+    shadowDirInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+
+    VkDescriptorImageInfo skyboxInfo{};
+    skyboxInfo.sampler     = skyboxSampler_;
+    skyboxInfo.imageView   = skyboxView_;
+    skyboxInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    std::array<VkWriteDescriptorSet, 4> writes{};
     writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet          = globalDescSet_;
     writes[0].dstBinding      = 0;
@@ -727,7 +972,21 @@ void HeadlessRenderer::allocateGlobalDescriptorSet() {
     writes[1].dstBinding      = 1;
     writes[1].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[1].descriptorCount = 1;
-    writes[1].pImageInfo      = &shadowInfo;
+    writes[1].pImageInfo      = &shadowCubeInfo;
+
+    writes[2].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[2].dstSet          = globalDescSet_;
+    writes[2].dstBinding      = 2;
+    writes[2].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[2].descriptorCount = 1;
+    writes[2].pImageInfo      = &shadowDirInfo;
+
+    writes[3].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[3].dstSet          = globalDescSet_;
+    writes[3].dstBinding      = 3;
+    writes[3].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[3].descriptorCount = 1;
+    writes[3].pImageInfo      = &skyboxInfo;
 
     vkUpdateDescriptorSets(device_, static_cast<uint32_t>(writes.size()),
                            writes.data(), 0, nullptr);
@@ -769,6 +1028,67 @@ void HeadlessRenderer::createDefaultMetalRoughTexture() {
     // Now both fallback views exist — create the white/default descriptor set.
     createTextureDescriptorSet(whiteTexView_, defaultMetalRoughView_, whiteTexDescSet_,
                                descriptorPool_);
+}
+
+void HeadlessRenderer::destroySkyboxTexture() {
+    if (skyboxView_) {
+        vkDestroyImageView(device_, skyboxView_, nullptr);
+        skyboxView_ = VK_NULL_HANDLE;
+    }
+    if (skyboxImage_) {
+        vkDestroyImage(device_, skyboxImage_, nullptr);
+        skyboxImage_ = VK_NULL_HANDLE;
+    }
+    if (skyboxImageMem_) {
+        vkFreeMemory(device_, skyboxImageMem_, nullptr);
+        skyboxImageMem_ = VK_NULL_HANDLE;
+    }
+}
+
+void HeadlessRenderer::updateSkyboxDescriptor() {
+    if (!globalDescSet_ || !skyboxSampler_ || !skyboxView_)
+        return;
+
+    VkDescriptorImageInfo skyboxInfo{};
+    skyboxInfo.sampler     = skyboxSampler_;
+    skyboxInfo.imageView   = skyboxView_;
+    skyboxInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet write{};
+    write.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet          = globalDescSet_;
+    write.dstBinding      = 3;
+    write.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.descriptorCount = 1;
+    write.pImageInfo      = &skyboxInfo;
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+}
+
+void HeadlessRenderer::createSkyboxTexture() {
+    destroySkyboxTexture();
+
+    if (!skyboxSampler_) {
+        VkSamplerCreateInfo sci{};
+        sci.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sci.magFilter    = VK_FILTER_LINEAR;
+        sci.minFilter    = VK_FILTER_LINEAR;
+        sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxLod       = 1.0f;
+        VK_CHECK(vkCreateSampler(device_, &sci, nullptr, &skyboxSampler_));
+    }
+
+    std::string resolvedPath = resolveDefaultSkyboxPath(skyboxPath_);
+    SkyboxPixels sky = loadSkyboxPixels(resolvedPath);
+    createImage(sky.width, sky.height, VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                skyboxImage_, skyboxImageMem_);
+    uploadImageToGPU(skyboxImage_, sky.rgba.data(), sky.width, sky.height);
+    skyboxView_ = createImageView(skyboxImage_, VK_FORMAT_R8G8B8A8_UNORM,
+                                  VK_IMAGE_ASPECT_COLOR_BIT);
+    updateSkyboxDescriptor();
 }
 
 // ---- Pipelines -------------------------------------------------------------
@@ -888,6 +1208,88 @@ void HeadlessRenderer::createShadowPipeline() {
     pci.renderPass          = shadowRenderPass_;
     pci.subpass             = 0;
     VK_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pci, nullptr, &shadowPipeline_));
+
+    vkDestroyShaderModule(device_, vert, nullptr);
+    vkDestroyShaderModule(device_, frag, nullptr);
+}
+
+void HeadlessRenderer::createSkyboxPipeline() {
+    VkShaderModule vert = spirvDir_.empty()
+        ? loadShaderFromMemory(k_skybox_vert_spv, k_skybox_vert_spv_size)
+        : loadShader(spirvDir_ + "/skybox.vert.spv");
+    VkShaderModule frag = spirvDir_.empty()
+        ? loadShaderFromMemory(k_skybox_frag_spv, k_skybox_frag_spv_size)
+        : loadShader(spirvDir_ + "/skybox.frag.spv");
+
+    VkPipelineShaderStageCreateInfo stages[2] = {};
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                 VK_SHADER_STAGE_VERTEX_BIT,   vert, "main", nullptr};
+    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                 VK_SHADER_STAGE_FRAGMENT_BIT, frag, "main", nullptr};
+
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkViewport vp{0, 0, (float)width_, (float)height_, 0.f, 1.f};
+    VkRect2D   sc{{0, 0}, {width_, height_}};
+    VkPipelineViewportStateCreateInfo vs{};
+    vs.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vs.viewportCount = 1;
+    vs.pViewports    = &vp;
+    vs.scissorCount  = 1;
+    vs.pScissors     = &sc;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode    = VK_CULL_MODE_NONE;
+    rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth   = 1.f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = msaaSamples_;
+
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable  = VK_FALSE;
+    ds.depthWriteEnable = VK_FALSE;
+    ds.depthCompareOp   = VK_COMPARE_OP_ALWAYS;
+
+    VkPipelineColorBlendAttachmentState blendAtt{};
+    blendAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                            | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments    = &blendAtt;
+
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts    = &globalSetLayout_;
+    VK_CHECK(vkCreatePipelineLayout(device_, &plci, nullptr, &skyboxPipelineLayout_));
+
+    VkGraphicsPipelineCreateInfo pci{};
+    pci.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pci.stageCount          = 2;
+    pci.pStages             = stages;
+    pci.pVertexInputState   = &vi;
+    pci.pInputAssemblyState = &ia;
+    pci.pViewportState      = &vs;
+    pci.pRasterizationState = &rs;
+    pci.pMultisampleState   = &ms;
+    pci.pDepthStencilState  = &ds;
+    pci.pColorBlendState    = &cb;
+    pci.layout              = skyboxPipelineLayout_;
+    pci.renderPass          = renderPass_;
+    pci.subpass             = 0;
+    VK_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pci, nullptr, &skyboxPipeline_));
 
     vkDestroyShaderModule(device_, vert, nullptr);
     vkDestroyShaderModule(device_, frag, nullptr);
@@ -1450,6 +1852,22 @@ void HeadlessRenderer::recordCommandBuffer(const Mat4& view, const Mat4& proj) {
         uboData_.cameraPos[1] = -(view.m[1][0]*t0 + view.m[1][1]*t1 + view.m[1][2]*t2);
         uboData_.cameraPos[2] = -(view.m[2][0]*t0 + view.m[2][1]*t1 + view.m[2][2]*t2);
         uboData_.cameraPos[3] = 0.f;
+        uboData_.cameraRight[0]   = view.m[0][0];
+        uboData_.cameraRight[1]   = view.m[0][1];
+        uboData_.cameraRight[2]   = view.m[0][2];
+        uboData_.cameraUp[0]      = view.m[1][0];
+        uboData_.cameraUp[1]      = view.m[1][1];
+        uboData_.cameraUp[2]      = view.m[1][2];
+        uboData_.cameraForward[0] = -view.m[2][0];
+        uboData_.cameraForward[1] = -view.m[2][1];
+        uboData_.cameraForward[2] = -view.m[2][2];
+        uboData_.skyboxParams[0]  = 1.f / std::max(std::abs(proj.m[1][1]), 0.0001f);
+        uboData_.skyboxParams[1]  = std::abs(proj.m[1][1] / proj.m[0][0]);
+        uboData_.skyboxParams[2]  = skyboxIntensity_;
+        uboData_.skyboxParams[3]  = skyboxView_ ? 1.f : 0.f;
+        uboData_.skyboxUp[0]      = skyboxUp_.x;
+        uboData_.skyboxUp[1]      = skyboxUp_.y;
+        uboData_.skyboxUp[2]      = skyboxUp_.z;
         uboData_.renderMode   = renderMode_;
         void* mapped;
         VK_CHECK(vkMapMemory(device_, sceneUBOMem_, 0, sizeof(SceneUBOData), 0, &mapped));
@@ -1470,6 +1888,13 @@ void HeadlessRenderer::recordCommandBuffer(const Mat4& view, const Mat4& proj) {
         vkCmdWriteTimestamp(cmdBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool_, 0);
 
     {
+        const bool renderPointShadow =
+            uboData_.lightColor[3] > 0.f
+         && uboData_.lightType == static_cast<uint32_t>(LightType::Point);
+        const bool renderDirectionalShadow =
+            uboData_.lightColor[3] > 0.f
+         && uboData_.lightType == static_cast<uint32_t>(LightType::Directional);
+
         // Layered omnidirectional cube shadow pass.
         //
         // All 6 faces are rendered in a single render pass using a layered framebuffer
@@ -1489,12 +1914,16 @@ void HeadlessRenderer::recordCommandBuffer(const Mat4& view, const Mat4& proj) {
         Vec3 lightPos = {uboData_.lightPos[0], uboData_.lightPos[1], uboData_.lightPos[2]};
         Mat4 faceProj = Mat4::perspectiveCube(1.5707963f, 1.f, SHADOW_NEAR, SHADOW_FAR);
 
-        // Upload the 6 face VP matrices to the UBO read by the vertex shader.
-        {
-            ShadowFacesUBOData facesData;
-            for (int f = 0; f < 6; ++f) {
-                Vec3 target = add(lightPos, kFaces[f].fwd);
-                facesData.vp[f] = faceProj * Mat4::lookAt(lightPos, target, kFaces[f].up);
+        // Upload the shadow VP matrices to the UBO read by the vertex shader.
+        if (renderPointShadow || renderDirectionalShadow) {
+            ShadowFacesUBOData facesData = {};
+            if (renderPointShadow) {
+                for (int f = 0; f < 6; ++f) {
+                    Vec3 target = add(lightPos, kFaces[f].fwd);
+                    facesData.vp[f] = faceProj * Mat4::lookAt(lightPos, target, kFaces[f].up);
+                }
+            } else {
+                facesData.vp[0] = uboData_.lightVP;
             }
             void* mapped;
             VK_CHECK(vkMapMemory(device_, shadowFacesUBOMem_, 0, sizeof(facesData), 0, &mapped));
@@ -1506,14 +1935,14 @@ void HeadlessRenderer::recordCommandBuffer(const Mat4& view, const Mat4& proj) {
         VkRenderPassBeginInfo rpi{};
         rpi.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         rpi.renderPass        = shadowRenderPass_;
-        rpi.framebuffer       = shadowLayeredFB_;
+        rpi.framebuffer       = renderDirectionalShadow ? shadowDirFB_ : shadowLayeredFB_;
         rpi.renderArea.extent = {SHADOW_MAP_SIZE, SHADOW_MAP_SIZE};
         rpi.clearValueCount   = 1;
         rpi.pClearValues      = &cv;
 
         vkCmdBeginRenderPass(cmdBuffer_, &rpi, VK_SUBPASS_CONTENTS_INLINE);
 
-        if (uboData_.lightColor[3] > 0.f) {
+        if (renderPointShadow || renderDirectionalShadow) {
             vkCmdBindPipeline(cmdBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline_);
             vkCmdBindDescriptorSets(cmdBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     shadowPipelineLayout_, 0, 1, &shadowFacesDescSet_, 0, nullptr);
@@ -1527,8 +1956,8 @@ void HeadlessRenderer::recordCommandBuffer(const Mat4& view, const Mat4& proj) {
                 spc.model = dc.transform;
                 vkCmdPushConstants(cmdBuffer_, shadowPipelineLayout_,
                                    VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(spc), &spc);
-                // instanceCount=6: gl_InstanceIndex (0..5) selects the cube face
-                vkCmdDrawIndexed(cmdBuffer_, dc.indexCount, 6, dc.firstIndex,
+                uint32_t instanceCount = renderPointShadow ? 6u : 1u;
+                vkCmdDrawIndexed(cmdBuffer_, dc.indexCount, instanceCount, dc.firstIndex,
                                  dc.vertexOffset, 0);
             }
         }
@@ -1544,9 +1973,9 @@ void HeadlessRenderer::recordCommandBuffer(const Mat4& view, const Mat4& proj) {
 
     {
         std::array<VkClearValue, 3> clears{};
-        clears[0].color        = {{0.08f, 0.08f, 0.1f, 1.0f}};
+        clears[0].color        = {{0.0f, 0.0f, 0.0f, 1.0f}};
         clears[1].depthStencil = {1.0f, 0};
-        clears[2].color        = {{0.08f, 0.08f, 0.1f, 1.0f}};
+        clears[2].color        = {{0.0f, 0.0f, 0.0f, 1.0f}};
 
         VkRenderPassBeginInfo rpi{};
         rpi.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -1557,12 +1986,21 @@ void HeadlessRenderer::recordCommandBuffer(const Mat4& view, const Mat4& proj) {
         rpi.pClearValues      = clears.data();
 
         vkCmdBeginRenderPass(cmdBuffer_, &rpi, VK_SUBPASS_CONTENTS_INLINE);
+
+        if (skyboxPipeline_ != VK_NULL_HANDLE && skyboxView_ != VK_NULL_HANDLE) {
+            vkCmdBindPipeline(cmdBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, skyboxPipeline_);
+            vkCmdBindDescriptorSets(cmdBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    skyboxPipelineLayout_, 0, 1, &globalDescSet_, 0, nullptr);
+            vkCmdDraw(cmdBuffer_, 3, 1, 0, 0);
+        }
+
         vkCmdBindPipeline(cmdBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
 
         // Set 0: global (UBO + shadow map)
         vkCmdBindDescriptorSets(cmdBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 pipelineLayout_, 0, 1, &globalDescSet_, 0, nullptr);
 
+        if (!drawCalls_.empty()) {
         VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(cmdBuffer_, 0, 1, &vertexBuffer_, &offset);
         vkCmdBindIndexBuffer(cmdBuffer_, indexBuffer_, 0, VK_INDEX_TYPE_UINT32);
@@ -1584,6 +2022,7 @@ void HeadlessRenderer::recordCommandBuffer(const Mat4& view, const Mat4& proj) {
             vkCmdDrawIndexed(cmdBuffer_, dc.indexCount, 1, dc.firstIndex,
                              dc.vertexOffset, 0);
         }
+        } // !drawCalls_.empty()
 
         vkCmdEndRenderPass(cmdBuffer_);
     }
@@ -1663,6 +2102,7 @@ void HeadlessRenderer::cleanup() {
     FM(defaultMetalRoughMem_)
     D(texSampler_,      vkDestroySampler)
     D(shadowSampler_,   vkDestroySampler)
+    D(skyboxSampler_,   vkDestroySampler)
 
     if (globalDescSet_)   { vkFreeDescriptorSets(device_, descriptorPool_, 1, &globalDescSet_);   globalDescSet_   = VK_NULL_HANDLE; }
     if (whiteTexDescSet_) { vkFreeDescriptorSets(device_, descriptorPool_, 1, &whiteTexDescSet_); whiteTexDescSet_ = VK_NULL_HANDLE; }
@@ -1678,11 +2118,14 @@ void HeadlessRenderer::cleanup() {
 
     D(pipeline_,             vkDestroyPipeline)
     D(pipelineLayout_,       vkDestroyPipelineLayout)
+    D(skyboxPipeline_,       vkDestroyPipeline)
+    D(skyboxPipelineLayout_, vkDestroyPipelineLayout)
     D(shadowPipeline_,       vkDestroyPipeline)
     D(shadowPipelineLayout_, vkDestroyPipelineLayout)
 
     D(framebuffer_,       vkDestroyFramebuffer)
     D(shadowLayeredFB_,   vkDestroyFramebuffer)
+    D(shadowDirFB_,       vkDestroyFramebuffer)
 
     D(frameFence_,    vkDestroyFence)
 
@@ -1698,8 +2141,14 @@ void HeadlessRenderer::cleanup() {
 
     D(shadowCubeView_,     vkDestroyImageView)
     D(shadowLayeredView_,  vkDestroyImageView)
+    D(shadowDirView_,      vkDestroyImageView)
+    D(skyboxView_,         vkDestroyImageView)
     D(shadowCubeImage_,    vkDestroyImage)
+    D(shadowDirImage_,     vkDestroyImage)
+    D(skyboxImage_,        vkDestroyImage)
     FM(shadowCubeImageMem_)
+    FM(shadowDirImageMem_)
+    FM(skyboxImageMem_)
 
     if (shadowFacesDescSet_) { vkFreeDescriptorSets(device_, descriptorPool_, 1, &shadowFacesDescSet_); shadowFacesDescSet_ = VK_NULL_HANDLE; }
 

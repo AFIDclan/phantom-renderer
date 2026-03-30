@@ -62,6 +62,21 @@ struct Mat4 {
         return r;
     }
 
+    // Orthographic projection for Vulkan depth range [0, 1], without the
+    // main-camera Y-flip. Used for offscreen directional shadow maps.
+    static Mat4 ortho(float left, float right,
+                      float bottom, float top,
+                      float nearZ, float farZ) {
+        Mat4 r = identity();
+        r.m[0][0] =  2.f / (right - left);
+        r.m[1][1] =  2.f / (top - bottom);
+        r.m[2][2] =  1.f / (nearZ - farZ);
+        r.m[3][0] = -(right + left) / (right - left);
+        r.m[3][1] = -(top + bottom) / (top - bottom);
+        r.m[3][2] =  nearZ / (nearZ - farZ);
+        return r;
+    }
+
     static Mat4 lookAt(Vec3 eye, Vec3 center, Vec3 up) {
         Vec3 f  = normalize(sub(center, eye));
         Vec3 r2 = normalize(cross(f, up));
@@ -143,3 +158,11 @@ struct Mat4 {
         return res;
     }
 };
+
+inline Vec3 transformPoint(const Mat4& m, Vec3 p) {
+    return {
+        m.m[0][0] * p.x + m.m[1][0] * p.y + m.m[2][0] * p.z + m.m[3][0],
+        m.m[0][1] * p.x + m.m[1][1] * p.y + m.m[2][1] * p.z + m.m[3][1],
+        m.m[0][2] * p.x + m.m[1][2] * p.y + m.m[2][2] * p.z + m.m[3][2],
+    };
+}

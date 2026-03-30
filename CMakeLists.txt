@@ -4,6 +4,8 @@ project(phantom-renderer LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include(GNUInstallDirs)
+
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
@@ -90,12 +92,22 @@ compile_shader(
     ${SHADER_SRC_DIR}/shadow.frag
     ${SHADER_OUT_DIR}/shadow.frag.spv
 )
+compile_shader(
+    ${SHADER_SRC_DIR}/skybox.vert
+    ${SHADER_OUT_DIR}/skybox.vert.spv
+)
+compile_shader(
+    ${SHADER_SRC_DIR}/skybox.frag
+    ${SHADER_OUT_DIR}/skybox.frag.spv
+)
 
 add_custom_target(shaders DEPENDS
     ${SHADER_OUT_DIR}/scene.vert.spv
     ${SHADER_OUT_DIR}/scene.frag.spv
     ${SHADER_OUT_DIR}/shadow.vert.spv
     ${SHADER_OUT_DIR}/shadow.frag.spv
+    ${SHADER_OUT_DIR}/skybox.vert.spv
+    ${SHADER_OUT_DIR}/skybox.frag.spv
 )
 
 # ---------------------------------------------------------------------------
@@ -109,7 +121,7 @@ set(SPIRV_BLOBS_HEADER "${SHADER_OUT_DIR}/spirv_blobs_generated.h")
 
 # Helper: emit one array per SPV file, then concatenate into the final header.
 set(_spv_headers "")
-foreach(_shader scene.vert scene.frag shadow.vert shadow.frag)
+foreach(_shader scene.vert scene.frag shadow.vert shadow.frag skybox.vert skybox.frag)
     string(REPLACE "." "_" _var "k_${_shader}_spv")   # e.g. k_scene_vert_spv
     set(_spv  "${SHADER_OUT_DIR}/${_shader}.spv")
     set(_hdr  "${SHADER_OUT_DIR}/${_shader}.spv.h")
@@ -137,6 +149,18 @@ add_custom_command(
 add_custom_target(spirv_blobs DEPENDS "${SPIRV_BLOBS_HEADER}")
 
 # ---------------------------------------------------------------------------
+# Runtime resources
+# ---------------------------------------------------------------------------
+
+set(RESOURCE_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/resources")
+set(RESOURCE_OUT_DIR "${CMAKE_BINARY_DIR}/resources")
+
+add_custom_target(copy_resources
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${RESOURCE_SRC_DIR} ${RESOURCE_OUT_DIR}
+    COMMENT "Copying runtime resources"
+)
+
+# ---------------------------------------------------------------------------
 # Library (for embedding into other projects, e.g. metavision)
 # ---------------------------------------------------------------------------
 
@@ -147,7 +171,7 @@ add_library(vh STATIC
     src/FrameOutput.cpp
 )
 
-add_dependencies(vh shaders spirv_blobs)
+add_dependencies(vh shaders spirv_blobs copy_resources)
 
 # tinygltf pulls in stb which generates many warnings — suppress for that TU only
 set_source_files_properties(src/GLTFLoader.cpp PROPERTIES COMPILE_OPTIONS "-w")
@@ -165,6 +189,12 @@ target_link_libraries(vh PUBLIC
     ${PNG_LIBRARIES}
 )
 
+target_compile_definitions(vh PUBLIC
+    VH_SOURCE_RESOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/resources"
+    VH_BUILD_RESOURCE_DIR="${CMAKE_BINARY_DIR}/resources"
+    VH_INSTALL_RESOURCE_DIR="${CMAKE_INSTALL_FULL_DATADIR}/phantom-renderer/resources"
+)
+
 target_compile_options(vh PRIVATE
     -Wall -Wextra -O2 -fPIC
 )
@@ -177,7 +207,7 @@ add_executable(phantom-renderer
     src/main.cpp
 )
 
-add_dependencies(phantom-renderer shaders)
+add_dependencies(phantom-renderer shaders copy_resources)
 
 target_link_libraries(phantom-renderer PRIVATE
     vh
@@ -197,9 +227,11 @@ target_compile_options(phantom-renderer PRIVATE
 
 set(SPIRV_OUTPUT_DIR ${SHADER_OUT_DIR})
 
-# Pass --scene if a Scene.gltf exists next to CMakeLists.txt
+# Pass --scene if a Scene.gltf or Scene.glb exists next to CMakeLists.txt
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Scene.gltf")
     set(SCENE_ARGS --scene "${CMAKE_CURRENT_SOURCE_DIR}/Scene.gltf")
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/Scene.glb")
+    set(SCENE_ARGS --scene "${CMAKE_CURRENT_SOURCE_DIR}/Scene.glb")
 else()
     set(SCENE_ARGS "")
 endif()
@@ -214,4 +246,14 @@ add_custom_target(run
     DEPENDS phantom-renderer shaders
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Running phantom-renderer renderer"
+)
+
+install(TARGETS vh phantom-renderer
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(DIRECTORY ${RESOURCE_SRC_DIR}/
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/phantom-renderer/resources
 )

@@ -32,15 +32,22 @@ struct ShadowFacesUBOData {
     Mat4 vp[6];
 };
 
-// CPU mirror of the per-frame UBO sent to the GPU (std140 layout, 64 bytes).
+// CPU mirror of the per-frame UBO sent to the GPU.
 struct SceneUBOData {
     float    lightPos[4];    // vec4, offset  0, size 16  (xyz = world light pos)
-    float    lightColor[4];  // vec4, offset 16, size 16  (w = intensity; 0 = prelit)
-    float    cameraPos[4];   // vec4, offset 32, size 16  (xyz = world eye pos)
-    uint32_t renderMode;     // uint, offset 48, size  4  (0=unlit, 1=lambert, 2=pbr)
-    float    shadowNear;     // float,offset 52, size  4  (cube shadow near plane)
-    float    shadowFar;      // float,offset 56, size  4  (cube shadow far plane)
-    uint32_t lightType;      // uint, offset 60, size  4  (mirrors LightType enum)
+    float    lightDir[4];    // vec4, offset 16, size 16  (xyz = world light direction)
+    float    lightColor[4];  // vec4, offset 32, size 16  (w = intensity; 0 = prelit)
+    float    cameraPos[4];   // vec4, offset 48, size 16  (xyz = world eye pos)
+    Mat4     lightVP;        // mat4, offset 64, size 64 (directional shadow matrix)
+    float    cameraRight[4];   // vec4, offset 128, size 16 (world-space camera basis)
+    float    cameraUp[4];      // vec4, offset 144, size 16 (world-space camera basis)
+    float    cameraForward[4]; // vec4, offset 160, size 16 (world-space camera basis)
+    float    skyboxParams[4];  // vec4, offset 176, size 16 (tanHalfFov, aspect, ambientIntensity, enabled)
+    float    skyboxUp[4];      // vec4, offset 192, size 16 (world-space up for environment sampling)
+    uint32_t renderMode;       // uint, offset 208, size  4  (0=unlit, 1=lambert, 2=pbr)
+    float    shadowNear;       // float,offset 212, size  4  (shadow near plane)
+    float    shadowFar;        // float,offset 216, size  4  (shadow far plane)
+    uint32_t lightType;        // uint, offset 220, size  4  (mirrors LightType enum)
 };
 
 // Per-frame GPU timing results.
@@ -90,6 +97,16 @@ public:
     // underlying memory into CUDA and read the result directly on the GPU.
     void renderNoReadback(const Mat4& view, const Mat4& proj);
 
+    // Override the environment map path. Empty selects the packaged default.
+    // Safe to call before or after init(); after init it hot-reloads the texture.
+    void setSkyboxPath(const std::string& path);
+
+    // Scalar multiplier for ambient lighting sampled from the skybox.
+    void setSkyboxIntensity(float intensity) { skyboxIntensity_ = intensity; }
+
+    // Select which world-space direction maps to the skybox's vertical axis.
+    void setSkyboxUp(Vec3 up);
+
     // Export the readback buffer's VkDeviceMemory as an opaque POSIX fd
     // (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR).  The caller must
     // close the fd after importing it via cudaImportExternalMemory().
@@ -121,6 +138,10 @@ private:
     void createSceneUBO();
     void allocateGlobalDescriptorSet(); // binds UBO + shadow sampler
     void createShadowPipeline();
+    void createSkyboxTexture();
+    void destroySkyboxTexture();
+    void updateSkyboxDescriptor();
+    void createSkyboxPipeline();
     void createGraphicsPipeline();
     void createCommandPool();
     void createReadbackBuffer();
@@ -165,10 +186,13 @@ private:
     // ---- state --------------------------------------------------------------
     uint32_t    width_, height_;
     std::string spirvDir_;
+    std::string skyboxPath_;
 
     std::vector<DrawCall>       drawCalls_;
     SceneUBOData                uboData_         = {};
     uint32_t                    renderMode_      = 2;  // 0=unlit, 1=lambert, 2=pbr
+    float                       skyboxIntensity_ = 0.25f;
+    Vec3                        skyboxUp_        = {0.f, 1.f, 0.f};
     FrameTimings                lastTimings_;
     float                       timestampPeriod_ = 1.f;
     bool                        hasTimestamps_   = false;
@@ -189,15 +213,23 @@ private:
     VkDeviceMemory        shadowCubeImageMem_        = VK_NULL_HANDLE;
     VkImageView           shadowCubeView_            = VK_NULL_HANDLE;  // cube view for sampling
     VkImageView           shadowLayeredView_          = VK_NULL_HANDLE;  // 2D-array view for layered FB
+    VkImage               shadowDirImage_            = VK_NULL_HANDLE;
+    VkDeviceMemory        shadowDirImageMem_         = VK_NULL_HANDLE;
+    VkImageView           shadowDirView_             = VK_NULL_HANDLE;  // 2D view for directional shadows
     VkSampler             shadowSampler_             = VK_NULL_HANDLE;
+    VkSampler             skyboxSampler_             = VK_NULL_HANDLE;
     VkRenderPass          shadowRenderPass_          = VK_NULL_HANDLE;
     VkFramebuffer         shadowLayeredFB_           = VK_NULL_HANDLE;  // single layered framebuffer
+    VkFramebuffer         shadowDirFB_               = VK_NULL_HANDLE;  // single 2D framebuffer
     VkBuffer              shadowFacesUBO_            = VK_NULL_HANDLE;  // 6 × mat4 face VPs
     VkDeviceMemory        shadowFacesUBOMem_         = VK_NULL_HANDLE;
     VkDescriptorSetLayout shadowFacesLayout_         = VK_NULL_HANDLE;
     VkDescriptorSet       shadowFacesDescSet_        = VK_NULL_HANDLE;
     VkPipelineLayout      shadowPipelineLayout_      = VK_NULL_HANDLE;
     VkPipeline            shadowPipeline_            = VK_NULL_HANDLE;
+    VkImage               skyboxImage_               = VK_NULL_HANDLE;
+    VkDeviceMemory        skyboxImageMem_            = VK_NULL_HANDLE;
+    VkImageView           skyboxView_                = VK_NULL_HANDLE;
 
     // Main render pass (MSAA)
     VkRenderPass          renderPass_     = VK_NULL_HANDLE;
@@ -258,6 +290,8 @@ private:
     // Main graphics pipeline
     VkPipelineLayout      pipelineLayout_   = VK_NULL_HANDLE;
     VkPipeline            pipeline_         = VK_NULL_HANDLE;
+    VkPipelineLayout      skyboxPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline            skyboxPipeline_       = VK_NULL_HANDLE;
 
     // Commands
     VkCommandPool         cmdPool_   = VK_NULL_HANDLE;

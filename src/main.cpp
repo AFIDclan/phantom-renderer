@@ -1,13 +1,14 @@
 /**
  * phantom-renderer: entry point
  *
- * Parses CLI arguments, loads a scene (glTF or built-in demo),
+ * Parses CLI arguments, loads a scene (glTF/GLB or built-in demo),
  * renders one frame with the headless Vulkan renderer, and writes
  * the result through the configured IFrameOutput.
  *
  * Usage:
- *   phantom-renderer [--scene <path.gltf>] [--output <out.png>]
+ *   phantom-renderer [--scene <path.gltf|path.glb>] [--output <out.png>]
  *                  [--width <px>] [--height <px>] [--spirv-dir <dir>]
+ *                  [--yaw-deg <deg>] [--skybox <path>] [--skybox-intensity <value>]
  *                  [--render-mode unlit|lambert|pbr]
  *
  * --spirv-dir is optional; omitting it uses the SPIR-V shaders compiled into
@@ -20,6 +21,7 @@
 #include "vh/Scene.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <memory>
 #include <stdexcept>
@@ -31,12 +33,15 @@ int main(int argc, char** argv) {
     std::string outputPath = "render_output.png";
     std::string spirvDir   = "";   // empty = use embedded SPIR-V blobs
     std::string scenePath  = "";
+    std::string skyboxPath = "";
     uint32_t    renderMode = 2;  // 0=unlit, 1=lambert, 2=pbr (default)
-    // Optional camera overrides (all three must be given together to take effect)
+    float       skyboxIntensity = 0.25f;
+    // Optional camera overrides.
     float eyeX   = 0, eyeY   = 0, eyeZ   = 0;
     float centX  = 0, centY  = 0, centZ  = 0;
     float fovY   = 0;
-    bool  hasEye = false, hasCenter = false, hasFov = false;
+    float yawDeg = 0;
+    bool  hasEye = false, hasCenter = false, hasFov = false, hasYaw = false;
     // Benchmark parameters
     int warmupFrames    = 5;   // frames rendered before timing starts
     int benchmarkFrames = 30;  // frames included in the timed average
@@ -48,6 +53,8 @@ int main(int argc, char** argv) {
         else if (a == "--width"       && i+1 < argc) width      = std::stoul(argv[++i]);
         else if (a == "--height"      && i+1 < argc) height     = std::stoul(argv[++i]);
         else if (a == "--spirv-dir"   && i+1 < argc) spirvDir   = argv[++i];
+        else if (a == "--skybox"      && i+1 < argc) skyboxPath = argv[++i];
+        else if (a == "--skybox-intensity" && i+1 < argc) skyboxIntensity = std::stof(argv[++i]);
         else if (a == "--render-mode" && i+1 < argc) {
             std::string m = argv[++i];
             if      (m == "unlit")   renderMode = 0;
@@ -57,6 +64,7 @@ int main(int argc, char** argv) {
         }
         else if (a == "--eye"    && i+3 < argc) { eyeX  = std::stof(argv[++i]); eyeY  = std::stof(argv[++i]); eyeZ  = std::stof(argv[++i]); hasEye    = true; }
         else if (a == "--center" && i+3 < argc) { centX = std::stof(argv[++i]); centY = std::stof(argv[++i]); centZ = std::stof(argv[++i]); hasCenter = true; }
+        else if ((a == "--yaw" || a == "--yaw-deg") && i+1 < argc) { yawDeg = std::stof(argv[++i]); hasYaw = true; }
         else if (a == "--fov"    && i+1 < argc) { fovY  = std::stof(argv[++i]); hasFov = true; }
         else if (a == "--warmup"  && i+1 < argc) { warmupFrames    = std::stoi(argv[++i]); }
         else if (a == "--frames"  && i+1 < argc) { benchmarkFrames = std::stoi(argv[++i]); }
@@ -96,6 +104,15 @@ int main(int argc, char** argv) {
     // Apply CLI camera overrides if provided
     if (hasEye)    { scene.camera().eye    = {eyeX, eyeY, eyeZ}; }
     if (hasCenter) { scene.camera().center = {centX, centY, centZ}; }
+    if (hasYaw) {
+        constexpr float kDegToRad = 3.14159265359f / 180.0f;
+        float yaw = yawDeg * kDegToRad;
+        scene.camera().center = {
+            scene.camera().eye.x + std::cos(yaw),
+            scene.camera().eye.y,
+            scene.camera().eye.z + std::sin(yaw),
+        };
+    }
     if (hasFov)    { scene.camera().fovY   = fovY; }
 
     if (scene.objectCount() == 0) {
@@ -113,6 +130,8 @@ int main(int argc, char** argv) {
 
         printf("Initialising Vulkan headless renderer (%ux%u)...\n", width, height);
         HeadlessRenderer renderer(width, height, spirvDir);
+        renderer.setSkyboxPath(skyboxPath);
+        renderer.setSkyboxIntensity(skyboxIntensity);
         renderer.init();
         renderer.setRenderMode(renderMode);
         const char* modeNames[] = {"unlit", "lambert", "pbr"};

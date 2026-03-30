@@ -33,7 +33,7 @@ struct TextureData {
 // Light — a KHR_lights_punctual scene light.
 //
 // type == Point       uses position + range; omnidirectional cube shadow map.
-// type == Directional uses direction only; ortho shadow map (not yet impl.).
+// type == Directional uses direction only; ortho shadow map.
 // type == Spot        uses position + direction + innerCone/outerCone
 //                     (single-frustum shadow, not yet impl.).
 // ----------------------------------------------------------------------------
