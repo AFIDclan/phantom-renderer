@@ -1852,14 +1852,17 @@ void HeadlessRenderer::recordCommandBuffer(const Mat4& view, const Mat4& proj) {
         uboData_.cameraPos[1] = -(view.m[1][0]*t0 + view.m[1][1]*t1 + view.m[1][2]*t2);
         uboData_.cameraPos[2] = -(view.m[2][0]*t0 + view.m[2][1]*t1 + view.m[2][2]*t2);
         uboData_.cameraPos[3] = 0.f;
+        // m[col][row] column-major: world-space camera axes are the ROWS of the
+        // view rotation (row 0 = right, row 1 = up, row 2 = -forward).
+        // Row k element i = m[i][k], NOT m[k][i].
         uboData_.cameraRight[0]   = view.m[0][0];
-        uboData_.cameraRight[1]   = view.m[0][1];
-        uboData_.cameraRight[2]   = view.m[0][2];
-        uboData_.cameraUp[0]      = view.m[1][0];
+        uboData_.cameraRight[1]   = view.m[1][0];
+        uboData_.cameraRight[2]   = view.m[2][0];
+        uboData_.cameraUp[0]      = view.m[0][1];
         uboData_.cameraUp[1]      = view.m[1][1];
-        uboData_.cameraUp[2]      = view.m[1][2];
-        uboData_.cameraForward[0] = -view.m[2][0];
-        uboData_.cameraForward[1] = -view.m[2][1];
+        uboData_.cameraUp[2]      = view.m[2][1];
+        uboData_.cameraForward[0] = -view.m[0][2];
+        uboData_.cameraForward[1] = -view.m[1][2];
         uboData_.cameraForward[2] = -view.m[2][2];
         uboData_.skyboxParams[0]  = 1.f / std::max(std::abs(proj.m[1][1]), 0.0001f);
         uboData_.skyboxParams[1]  = std::abs(proj.m[1][1] / proj.m[0][0]);
