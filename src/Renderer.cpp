@@ -1358,7 +1358,7 @@ void HeadlessRenderer::createGraphicsPipeline() {
     ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     ds.depthTestEnable  = VK_TRUE;
     ds.depthWriteEnable = VK_TRUE;
-    ds.depthCompareOp   = VK_COMPARE_OP_LESS;
+    ds.depthCompareOp   = VK_COMPARE_OP_GREATER;   // reversed-Z: see Mat4::perspective
 
     VkPipelineColorBlendAttachmentState blendAtt{};
     blendAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
@@ -2003,7 +2003,7 @@ void HeadlessRenderer::recordCommandBuffer(const Mat4& view, const Mat4& proj) {
     {
         std::array<VkClearValue, 3> clears{};
         clears[0].color        = {{0.0f, 0.0f, 0.0f, 1.0f}};
-        clears[1].depthStencil = {1.0f, 0};
+        clears[1].depthStencil = {0.0f, 0};   // reversed-Z: far plane is 0
         clears[2].color        = {{0.0f, 0.0f, 0.0f, 1.0f}};
 
         VkRenderPassBeginInfo rpi{};

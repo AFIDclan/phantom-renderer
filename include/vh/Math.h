@@ -35,15 +35,19 @@ struct Mat4 {
         return r;
     }
 
-    // Vulkan perspective: Y-axis flipped in NDC, depth mapped to [0, 1].
+    // Vulkan perspective: Y-axis flipped in NDC, reversed-Z depth (near maps
+    // to 1, far to 0).  With the float depth buffer this spreads precision
+    // evenly over distance, so farZ can be kilometres without z-fighting.
+    // The scene pipeline clears depth to 0 and tests GREATER to match.
+    // Shadow passes use perspectiveCube()/ortho(), which keep standard depth.
     static Mat4 perspective(float fovY, float aspect, float nearZ, float farZ) {
         float t = std::tan(fovY * 0.5f);
         Mat4 r;
         r.m[0][0] =  1.f / (aspect * t);
         r.m[1][1] = -1.f / t;                          // flip Y for Vulkan NDC
-        r.m[2][2] =  farZ / (nearZ - farZ);
+        r.m[2][2] =  nearZ / (farZ - nearZ);
         r.m[2][3] = -1.f;
-        r.m[3][2] = -(farZ * nearZ) / (farZ - nearZ);
+        r.m[3][2] =  (farZ * nearZ) / (farZ - nearZ);
         return r;
     }
 

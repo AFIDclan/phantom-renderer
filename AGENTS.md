@@ -72,6 +72,7 @@ shaders/
 ### Geometry pipeline
 - All mesh primitives are merged into a single GPU vertex + index buffer per `uploadScene()` call.
 - Per-draw transforms are pushed with a `PushConstants` struct (model + view + proj mat4), followed by a 16-byte material block (`alphaCutoff`, `alphaMode`, `baseAlpha`) read by `scene.frag` at offset 192.
+- Depth is reversed-Z in the main pass (`Mat4::perspective` maps near → 1, far → 0; depth clear 0.0, compare GREATER) so the far plane can be kilometres away. The shadow passes keep standard depth via `perspectiveCube()` / `ortho()`.
 - glTF `alphaMode` is honoured: MASK discards fragments below `alphaCutoff` in the main pipeline; BLEND draws go through a second pipeline (blend on, depth write off) after all opaque/masked draws, sorted back to front by mesh AABB centre each frame. `doubleSided` is read but has no effect because the scene pipeline never culls.
 - Index buffers are always `VK_INDEX_TYPE_UINT32`; uint8/uint16 indices from glTF are upconverted in `GLTFLoader.cpp`.
 - NORMAL accessor stride is read from `bufferView.byteStride` — handles Blender's interleaved output.
