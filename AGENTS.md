@@ -10,7 +10,7 @@ Headless Vulkan renderer for the Daxos vision pipeline. Renders glTF 2.0 scenes 
 
 - **Hardware**: Jetson Orin (nvgpu), arm64, Ubuntu 22.04 Jammy
 - **Vulkan**: instance 1.3.204 / device 1.3.251, no swapchain (offscreen only)
-- **Push constant limit**: spec guarantees 128 bytes; Orin supports 192 bytes (3 × mat4) — confirmed working, do not increase without re-testing
+- **Push constant limit**: spec guarantees 128 bytes; Orin reports `maxPushConstantsSize = 256`. The scene pipeline uses 208 bytes (3 × mat4 + a 16-byte material block for the fragment stage) — confirmed working 2026-10-19. Do not exceed 256.
 - **Shader compiler**: `glslangValidator` (from `glslang-tools`). `glslc` is also installed and detected by CMake, which prefers it. Both produce compatible SPIR-V.
 
 ---
@@ -58,7 +58,9 @@ src/
   main.cpp        — CLI entry point (~100 lines)
 
 shaders/
-  scene.vert / scene.frag  — GLSL sources; compiled to build/shaders/*.spv
+  scene.vert / scene.frag  — main pass GLSL; compiled to build/shaders/*.spv
+  shadow.vert / shadow.frag — depth-only shadow pass
+  skybox.vert / skybox.frag — full-screen equirect skybox fill (drawn first, no depth)
 ```
 
 **Do not** define `TINYGLTF_IMPLEMENTATION`, `STB_IMAGE_IMPLEMENTATION`, or `STB_IMAGE_WRITE_IMPLEMENTATION` in any file other than `src/GLTFLoader.cpp`.
@@ -69,7 +71,8 @@ shaders/
 
 ### Geometry pipeline
 - All mesh primitives are merged into a single GPU vertex + index buffer per `uploadScene()` call.
-- Per-draw transforms are pushed with a `PushConstants` struct (model + view + proj mat4).
+- Per-draw transforms are pushed with a `PushConstants` struct (model + view + proj mat4), followed by a 16-byte material block (`alphaCutoff`, `alphaMode`, `baseAlpha`) read by `scene.frag` at offset 192.
+- glTF `alphaMode` is honoured: MASK discards fragments below `alphaCutoff` in the main pipeline; BLEND draws go through a second pipeline (blend on, depth write off) after all opaque/masked draws, sorted back to front by mesh AABB centre each frame. `doubleSided` is read but has no effect because the scene pipeline never culls.
 - Index buffers are always `VK_INDEX_TYPE_UINT32`; uint8/uint16 indices from glTF are upconverted in `GLTFLoader.cpp`.
 - NORMAL accessor stride is read from `bufferView.byteStride` — handles Blender's interleaved output.
 

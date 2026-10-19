@@ -8,17 +8,24 @@
 #include <vulkan/vulkan.h>
 
 // ----------------------------------------------------------------------------
-// PushConstants — per-draw-call data pushed directly to the vertex shader.
-// Must stay in sync with the layout in shaders/scene.vert.
-// 3 × mat4 = 192 bytes (exceeds the 128-byte minimum guarantee; confirmed
-// working on Tegra Orin).
+// PushConstants — per-draw-call data pushed to the vertex and fragment shaders.
+// Must stay in sync with shaders/scene.vert (the mat4 block) and
+// shaders/scene.frag (the material block at offset 192).
+// 3 × mat4 + 16-byte material block = 208 bytes (exceeds the 128-byte minimum
+// guarantee; Tegra Orin reports maxPushConstantsSize = 256, confirmed working).
 // ----------------------------------------------------------------------------
 
 struct PushConstants {
-    Mat4 model;
-    Mat4 view;
-    Mat4 proj;
+    Mat4     model;
+    Mat4     view;
+    Mat4     proj;
+    float    alphaCutoff;   // glTF alphaCutoff, used when alphaMode == Mask
+    uint32_t alphaMode;     // AlphaMode (Mesh.h): 0 opaque, 1 mask, 2 blend
+    float    baseAlpha;     // baseColorFactor alpha
+    uint32_t _pad0;
 };
+static_assert(sizeof(PushConstants) == 208,
+              "PushConstants layout must match scene.vert / scene.frag");
 
 // Shadow pass push constants — model only (64 bytes). lightVP now comes from
 // the ShadowFacesUBO, indexed by gl_InstanceIndex in the vertex shader.
@@ -289,7 +296,10 @@ private:
 
     // Main graphics pipeline
     VkPipelineLayout      pipelineLayout_   = VK_NULL_HANDLE;
-    VkPipeline            pipeline_         = VK_NULL_HANDLE;
+    VkPipeline            pipeline_         = VK_NULL_HANDLE;  // opaque + alpha-mask draws
+    VkPipeline            blendPipeline_    = VK_NULL_HANDLE;  // alpha-blend draws (no depth write)
+    std::vector<uint32_t> opaqueDrawOrder_;   // indices into drawCalls_, alphaMode != Blend
+    std::vector<uint32_t> blendDrawOrder_;    // indices into drawCalls_, sorted back to front per frame
     VkPipelineLayout      skyboxPipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline            skyboxPipeline_       = VK_NULL_HANDLE;
 

@@ -44,6 +44,13 @@ enum class LightType : uint32_t {
     Spot        = 2,
 };
 
+// glTF material alphaMode.  Values are pushed to scene.frag as-is.
+enum class AlphaMode : uint32_t {
+    Opaque = 0,   // texture alpha ignored
+    Mask   = 1,   // fragment discarded when alpha < alphaCutoff
+    Blend  = 2,   // drawn after opaque geometry, back to front, alpha-blended
+};
+
 struct Light {
     LightType type      = LightType::Point;
     Vec3      position  = {};           // world space (Point, Spot)
@@ -86,6 +93,11 @@ struct Mesh {
     std::vector<uint32_t> indices;
     int                   textureIdx       = -1;  // index into Scene::textures, or -1
     int                   metalRoughTexIdx = -1;  // metallic-roughness texture (G=rough, B=metal)
+    AlphaMode             alphaMode        = AlphaMode::Opaque;
+    float                 alphaCutoff      = 0.5f;   // glTF default
+    float                 baseAlpha        = 1.f;    // baseColorFactor[3]
+    bool                  doubleSided      = false;  // informational: the scene pipeline never culls
+    Vec3                  localCenter      = {0.f, 0.f, 0.f};  // AABB centre in mesh space (blend sorting)
 };
 
 // ----------------------------------------------------------------------------
@@ -101,6 +113,11 @@ struct DrawCall {
     Mat4     transform;          // model-to-world matrix
     int32_t  textureIdx       = -1;  // index into RenderScene::textures, or -1
     int32_t  metalRoughTexIdx = -1;  // metallic-roughness texture index, or -1
+    AlphaMode alphaMode       = AlphaMode::Opaque;
+    float    alphaCutoff      = 0.5f;
+    float    baseAlpha        = 1.f;
+    bool     doubleSided      = false;
+    Vec3     worldCenter      = {0.f, 0.f, 0.f};  // mesh AABB centre in world space (blend sorting)
 };
 
 // ----------------------------------------------------------------------------

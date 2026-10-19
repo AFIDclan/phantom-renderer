@@ -7,7 +7,9 @@
 #include "vh/GLTFLoader.h"
 #include "vh/Scene.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <unordered_map>
 
@@ -110,8 +112,12 @@ static void processNode(
             // Non-indexed geometry is supported: we synthesize sequential indices.
 
             // Base colour factor (modulates the texture, or IS the colour if no texture)
-            float color[3] = {0.8f, 0.8f, 0.8f};
-            int   sceneTex = -1;
+            float     color[3]    = {0.8f, 0.8f, 0.8f};
+            float     baseAlpha   = 1.f;
+            float     alphaCutoff = 0.5f;
+            AlphaMode alphaMode   = AlphaMode::Opaque;
+            bool      doubleSided = false;
+            int       sceneTex    = -1;
             if (prim.material >= 0) {
                 const auto& mat = model.materials[prim.material];
                 const auto& pbr = mat.pbrMetallicRoughness;
@@ -120,6 +126,13 @@ static void processNode(
                     color[1] = (float)pbr.baseColorFactor[1];
                     color[2] = (float)pbr.baseColorFactor[2];
                 }
+                if (pbr.baseColorFactor.size() >= 4)
+                    baseAlpha = (float)pbr.baseColorFactor[3];
+                // Alpha handling (tinygltf defaults: OPAQUE, cutoff 0.5, single-sided)
+                if      (mat.alphaMode == "MASK")  alphaMode = AlphaMode::Mask;
+                else if (mat.alphaMode == "BLEND") alphaMode = AlphaMode::Blend;
+                alphaCutoff = (float)mat.alphaCutoff;
+                doubleSided = mat.doubleSided;
                 // Look up uploaded base-colour texture (if any)
                 if (pbr.baseColorTexture.index >= 0) {
                     auto it = gltfTexToSceneTex.find(pbr.baseColorTexture.index);
@@ -148,7 +161,11 @@ static void processNode(
             mesh.name = gltfMesh.name.empty()
                 ? ("mesh_" + std::to_string(objCounter))
                 : gltfMesh.name;
-            mesh.textureIdx = sceneTex;
+            mesh.textureIdx  = sceneTex;
+            mesh.alphaMode   = alphaMode;
+            mesh.alphaCutoff = alphaCutoff;
+            mesh.baseAlpha   = baseAlpha;
+            mesh.doubleSided = doubleSided;
             int sceneMRTex = -1;
             if (prim.material >= 0) {
                 const auto& mat = model.materials[prim.material];
@@ -162,6 +179,8 @@ static void processNode(
             mesh.metalRoughTexIdx = sceneMRTex;
 
             mesh.vertices.reserve(nVerts);
+            Vec3 bbMin{ std::numeric_limits<float>::max(),  std::numeric_limits<float>::max(),  std::numeric_limits<float>::max()};
+            Vec3 bbMax{-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max()};
             for (size_t i = 0; i < nVerts; ++i) {
                 Vec3  p = readVec3(model, posAcc, i);
                 Vec3  n = normAcc >= 0 ? readVec3(model, normAcc, i) : Vec3{0, 1, 0};
@@ -171,7 +190,11 @@ static void processNode(
                                          {color[0], color[1], color[2]},
                                          {n.x, n.y, n.z},
                                          {u, v}});
+                bbMin = {std::min(bbMin.x, p.x), std::min(bbMin.y, p.y), std::min(bbMin.z, p.z)};
+                bbMax = {std::max(bbMax.x, p.x), std::max(bbMax.y, p.y), std::max(bbMax.z, p.z)};
             }
+            if (nVerts > 0)
+                mesh.localCenter = mul(add(bbMin, bbMax), 0.5f);
 
             if (prim.indices >= 0) {
                 size_t nIdx = model.accessors[prim.indices].count;

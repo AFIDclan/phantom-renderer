@@ -80,7 +80,12 @@ RenderScene Scene::buildRenderScene() const {
             vertexStart,
             obj.transform(),
             mesh.textureIdx,
-            mesh.metalRoughTexIdx
+            mesh.metalRoughTexIdx,
+            mesh.alphaMode,
+            mesh.alphaCutoff,
+            mesh.baseAlpha,
+            mesh.doubleSided,
+            transformPoint(obj.transform(), mesh.localCenter)
         });
     }
     return rs;

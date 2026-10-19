@@ -8,7 +8,9 @@
  * Usage:
  *   phantom-renderer [--scene <path.gltf|path.glb>] [--output <out.png>]
  *                  [--width <px>] [--height <px>] [--spirv-dir <dir>]
- *                  [--yaw-deg <deg>] [--skybox <path>] [--skybox-intensity <value>]
+ *                  [--eye x y z] [--center x y z] [--up x y z] [--yaw-deg <deg>]
+ *                  [--fov <rad>] [--near <m>] [--far <m>]
+ *                  [--skybox <path>] [--skybox-intensity <value>]
  *                  [--render-mode unlit|lambert|pbr]
  *
  * --spirv-dir is optional; omitting it uses the SPIR-V shaders compiled into
@@ -39,9 +41,12 @@ int main(int argc, char** argv) {
     // Optional camera overrides.
     float eyeX   = 0, eyeY   = 0, eyeZ   = 0;
     float centX  = 0, centY  = 0, centZ  = 0;
+    float upX    = 0, upY    = 0, upZ    = 0;
     float fovY   = 0;
     float yawDeg = 0;
-    bool  hasEye = false, hasCenter = false, hasFov = false, hasYaw = false;
+    float nearZ  = 0, farZ = 0;
+    bool  hasEye = false, hasCenter = false, hasUp = false, hasFov = false, hasYaw = false;
+    bool  hasNear = false, hasFar = false;
     // Benchmark parameters
     int warmupFrames    = 5;   // frames rendered before timing starts
     int benchmarkFrames = 30;  // frames included in the timed average
@@ -65,7 +70,10 @@ int main(int argc, char** argv) {
         else if (a == "--eye"    && i+3 < argc) { eyeX  = std::stof(argv[++i]); eyeY  = std::stof(argv[++i]); eyeZ  = std::stof(argv[++i]); hasEye    = true; }
         else if (a == "--center" && i+3 < argc) { centX = std::stof(argv[++i]); centY = std::stof(argv[++i]); centZ = std::stof(argv[++i]); hasCenter = true; }
         else if ((a == "--yaw" || a == "--yaw-deg") && i+1 < argc) { yawDeg = std::stof(argv[++i]); hasYaw = true; }
+        else if (a == "--up"     && i+3 < argc) { upX   = std::stof(argv[++i]); upY   = std::stof(argv[++i]); upZ   = std::stof(argv[++i]); hasUp     = true; }
         else if (a == "--fov"    && i+1 < argc) { fovY  = std::stof(argv[++i]); hasFov = true; }
+        else if (a == "--near"   && i+1 < argc) { nearZ = std::stof(argv[++i]); hasNear = true; }
+        else if (a == "--far"    && i+1 < argc) { farZ  = std::stof(argv[++i]); hasFar = true; }
         else if (a == "--warmup"  && i+1 < argc) { warmupFrames    = std::stoi(argv[++i]); }
         else if (a == "--frames"  && i+1 < argc) { benchmarkFrames = std::stoi(argv[++i]); }
     }
@@ -113,7 +121,10 @@ int main(int argc, char** argv) {
             scene.camera().eye.z + std::sin(yaw),
         };
     }
+    if (hasUp)     { scene.camera().up     = {upX, upY, upZ}; }
     if (hasFov)    { scene.camera().fovY   = fovY; }
+    if (hasNear)   { scene.camera().nearZ  = nearZ; }
+    if (hasFar)    { scene.camera().farZ   = farZ; }
 
     if (scene.objectCount() == 0) {
         fprintf(stderr, "Scene has no objects — nothing to render.\n");

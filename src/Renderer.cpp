@@ -3,6 +3,7 @@
 
 #include "stb_image.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstdlib>
@@ -316,6 +317,10 @@ void HeadlessRenderer::uploadScene(const RenderScene& scene) {
         uploadToDevice(indexBuffer_, scene.indices.data(), sz);
     }
     drawCalls_ = scene.draws;
+    opaqueDrawOrder_.clear();
+    blendDrawOrder_.clear();
+    for (uint32_t i = 0; i < drawCalls_.size(); ++i)
+        (drawCalls_[i].alphaMode == AlphaMode::Blend ? blendDrawOrder_ : opaqueDrawOrder_).push_back(i);
 
     // ---- Textures -----------------------------------------------------------
     uploadTexturesToGPU(scene.textures);
@@ -1365,7 +1370,7 @@ void HeadlessRenderer::createGraphicsPipeline() {
     cb.pAttachments    = &blendAtt;
 
     VkPushConstantRange pcRange{};
-    pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pcRange.offset     = 0;
     pcRange.size       = sizeof(PushConstants);
 
@@ -1393,6 +1398,27 @@ void HeadlessRenderer::createGraphicsPipeline() {
     pci.renderPass          = renderPass_;
     pci.subpass             = 0;
     VK_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline_));
+
+    // Alpha-blend variant: same shaders and layout, but blended over the colour
+    // buffer and without depth writes.  recordCommandBuffer() draws it after all
+    // opaque/masked geometry, back to front.  Alpha factors ZERO/ONE leave the
+    // attachment alpha at its cleared 1.0, so the resolved frame stays fully
+    // opaque for consumers that forward the alpha channel.
+    VkPipelineColorBlendAttachmentState blendAttOn = blendAtt;
+    blendAttOn.blendEnable         = VK_TRUE;
+    blendAttOn.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    blendAttOn.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blendAttOn.colorBlendOp        = VK_BLEND_OP_ADD;
+    blendAttOn.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    blendAttOn.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blendAttOn.alphaBlendOp        = VK_BLEND_OP_ADD;
+    VkPipelineColorBlendStateCreateInfo cbBlend = cb;
+    cbBlend.pAttachments = &blendAttOn;
+    VkPipelineDepthStencilStateCreateInfo dsBlend = ds;
+    dsBlend.depthWriteEnable = VK_FALSE;
+    pci.pColorBlendState   = &cbBlend;
+    pci.pDepthStencilState = &dsBlend;
+    VK_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pci, nullptr, &blendPipeline_));
 
     vkDestroyShaderModule(device_, vert, nullptr);
     vkDestroyShaderModule(device_, frag, nullptr);
@@ -1997,34 +2023,54 @@ void HeadlessRenderer::recordCommandBuffer(const Mat4& view, const Mat4& proj) {
             vkCmdDraw(cmdBuffer_, 3, 1, 0, 0);
         }
 
-        vkCmdBindPipeline(cmdBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
-
-        // Set 0: global (UBO + shadow map)
+        // Set 0: global (UBO + shadow map); shared by both scene pipelines.
         vkCmdBindDescriptorSets(cmdBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 pipelineLayout_, 0, 1, &globalDescSet_, 0, nullptr);
 
         if (!drawCalls_.empty()) {
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(cmdBuffer_, 0, 1, &vertexBuffer_, &offset);
-        vkCmdBindIndexBuffer(cmdBuffer_, indexBuffer_, 0, VK_INDEX_TYPE_UINT32);
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(cmdBuffer_, 0, 1, &vertexBuffer_, &offset);
+            vkCmdBindIndexBuffer(cmdBuffer_, indexBuffer_, 0, VK_INDEX_TYPE_UINT32);
 
-        for (size_t i = 0; i < drawCalls_.size(); ++i) {
-            const auto& dc = drawCalls_[i];
-            // Set 1: per-draw (baseColor + metalRough); fallback to white/default
-            VkDescriptorSet texSet = (i < drawDescSets_.size() && drawDescSets_[i] != VK_NULL_HANDLE)
-                                   ? drawDescSets_[i] : whiteTexDescSet_;
-            vkCmdBindDescriptorSets(cmdBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    pipelineLayout_, 1, 1, &texSet, 0, nullptr);
+            auto drawOne = [&](uint32_t i) {
+                const auto& dc = drawCalls_[i];
+                // Set 1: per-draw (baseColor + metalRough); fallback to white/default
+                VkDescriptorSet texSet = (i < drawDescSets_.size() && drawDescSets_[i] != VK_NULL_HANDLE)
+                                       ? drawDescSets_[i] : whiteTexDescSet_;
+                vkCmdBindDescriptorSets(cmdBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        pipelineLayout_, 1, 1, &texSet, 0, nullptr);
 
-            PushConstants pc;
-            pc.model = dc.transform;
-            pc.view  = view;
-            pc.proj  = proj;
-            vkCmdPushConstants(cmdBuffer_, pipelineLayout_,
-                               VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
-            vkCmdDrawIndexed(cmdBuffer_, dc.indexCount, 1, dc.firstIndex,
-                             dc.vertexOffset, 0);
-        }
+                PushConstants pc;
+                pc.model       = dc.transform;
+                pc.view        = view;
+                pc.proj        = proj;
+                pc.alphaCutoff = dc.alphaCutoff;
+                pc.alphaMode   = static_cast<uint32_t>(dc.alphaMode);
+                pc.baseAlpha   = dc.baseAlpha;
+                pc._pad0       = 0;
+                vkCmdPushConstants(cmdBuffer_, pipelineLayout_,
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   0, sizeof(pc), &pc);
+                vkCmdDrawIndexed(cmdBuffer_, dc.indexCount, 1, dc.firstIndex,
+                                 dc.vertexOffset, 0);
+            };
+
+            // Opaque and alpha-masked draws: depth tested and written, any order.
+            vkCmdBindPipeline(cmdBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+            for (uint32_t i : opaqueDrawOrder_) drawOne(i);
+
+            // Alpha-blended draws: after everything opaque, farthest first, no depth write.
+            if (!blendDrawOrder_.empty()) {
+                const Vec3 cam{uboData_.cameraPos[0], uboData_.cameraPos[1], uboData_.cameraPos[2]};
+                std::sort(blendDrawOrder_.begin(), blendDrawOrder_.end(),
+                          [&](uint32_t a, uint32_t b) {
+                              Vec3 da = sub(drawCalls_[a].worldCenter, cam);
+                              Vec3 db = sub(drawCalls_[b].worldCenter, cam);
+                              return dot(da, da) > dot(db, db);
+                          });
+                vkCmdBindPipeline(cmdBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, blendPipeline_);
+                for (uint32_t i : blendDrawOrder_) drawOne(i);
+            }
         } // !drawCalls_.empty()
 
         vkCmdEndRenderPass(cmdBuffer_);
@@ -2120,6 +2166,7 @@ void HeadlessRenderer::cleanup() {
     FM(shadowFacesUBOMem_)
 
     D(pipeline_,             vkDestroyPipeline)
+    D(blendPipeline_,        vkDestroyPipeline)
     D(pipelineLayout_,       vkDestroyPipelineLayout)
     D(skyboxPipeline_,       vkDestroyPipeline)
     D(skyboxPipelineLayout_, vkDestroyPipelineLayout)

@@ -34,6 +34,14 @@ layout(set = 0, binding = 3) uniform sampler2D skyboxMap;
 layout(set = 1, binding = 0) uniform sampler2D baseColorTex;
 layout(set = 1, binding = 1) uniform sampler2D metalRoughTex; // G=roughness, B=metallic
 
+// Per-draw material block; the tail of the PushConstants struct in Renderer.h
+// (the first 192 bytes are the three mat4s consumed by scene.vert).
+layout(push_constant) uniform MaterialPC {
+    layout(offset = 192) float alphaCutoff;
+    uint  alphaMode;    // AlphaMode in Mesh.h: 0 opaque, 1 mask, 2 blend
+    float baseAlpha;
+} mpc;
+
 const float PI = 3.14159265359;
 
 vec2 skyboxUV(vec3 dir) {
@@ -108,11 +116,18 @@ vec3 F_Schlick(float cosTheta, vec3 F0) {
 }
 
 void main() {
-    vec3  baseColor = texture(baseColorTex, fragUV).rgb * fragColor;
+    vec4  texel     = texture(baseColorTex, fragUV);
+    vec3  baseColor = texel.rgb * fragColor;
+    float alpha     = texel.a * mpc.baseAlpha;
+    // glTF alphaMode: MASK is a hard cutout at alphaCutoff, BLEND keeps alpha
+    // for the blend pipeline, OPAQUE ignores texture alpha entirely.
+    if (mpc.alphaMode == 1u && alpha < mpc.alphaCutoff)
+        discard;
+    float outAlpha  = (mpc.alphaMode == 2u) ? alpha : 1.0;
     float intensity = ubo.lightColor.w;
 
     if (ubo.renderMode == 0u) {
-        outColor = vec4(baseColor, 1.0);
+        outColor = vec4(baseColor, outAlpha);
         return;
     }
 
@@ -125,7 +140,7 @@ void main() {
             color = color / (color + vec3(1.0));
             color = pow(color, vec3(1.0 / 2.2));
         }
-        outColor = vec4(color, 1.0);
+        outColor = vec4(color, outAlpha);
         return;
     }
 
@@ -150,7 +165,7 @@ void main() {
 
     // --- LAMBERT ---
     if (ubo.renderMode == 1u) {
-        outColor = vec4(ambientColor + baseColor * (radiance * NdotL * shadow), 1.0);
+        outColor = vec4(ambientColor + baseColor * (radiance * NdotL * shadow), outAlpha);
         return;
     }
 
@@ -186,5 +201,5 @@ void main() {
     color = color / (color + vec3(1.0));
     color = pow(color, vec3(1.0 / 2.2));
 
-    outColor = vec4(color, 1.0);
+    outColor = vec4(color, outAlpha);
 }
